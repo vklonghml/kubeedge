@@ -101,3 +101,4 @@ func (m *manager) updatePodStatus() {
 		m.apiStatusVersions[pod.UID] = podStatus.DeepCopy()
 	}
 }
+

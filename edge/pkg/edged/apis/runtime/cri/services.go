@@ -26,9 +26,11 @@ Changes done are
 package cri
 
 import (
+
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	v1 "k8s.io/api/core/v1"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 )
 
@@ -76,6 +78,7 @@ type Container struct {
 	// Status of the container.
 	Status  kubecontainer.ContainerState `json:"status,omitempty"`
 	StartAt time.Time                    `json:"startat,omitempty"`
+	Name    string                       `json:"name,omitempty"`
 }
 
 //ContainerInspect checks container status
@@ -94,6 +97,7 @@ type ContainerStatus struct {
 	// Log path of container.
 	LogPath      string `json:"log_path,omitempty"`
 	RestartCount int32  `json:"restartCount"`
+
 }
 
 // Device specifies a host device to mount into a container.
@@ -126,6 +130,7 @@ type RuntimeService interface {
 	ListContainers() ([]*Container, error)
 	ContainerStatus(containerID string) (*ContainerStatus, error)
 	InspectContainer(containerID string) (*ContainerInspect, error)
+	EnsureImageExists(pod *v1.Pod, container *v1.Container, secrets []v1.Secret) error
 }
 
 //constants for defining prefix in docker
