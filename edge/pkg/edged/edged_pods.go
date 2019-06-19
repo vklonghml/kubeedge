@@ -243,6 +243,15 @@ func (e *edged) GenerateContainerOptions(pod *v1.Pod) (map[string]*kubecontainer
 	}
 	podName := util.GetUniquePodName(pod)
 	volumes := e.volumeManager.GetMountedVolumesForPod(podName)
+	for _, container := range pod.Spec.InitContainers {
+		opt := kubecontainer.RunContainerOptions{}
+		mounts, err := makeMounts(pod, e.getPodDir(pod.UID), &container, hostname, hostDomainName, pod.Status.PodIP, volumes)
+		if err != nil {
+			return nil, err
+		}
+		opt.Mounts = append(opt.Mounts, mounts...)
+		opts[container.Name] = &opt
+	}
 	for _, container := range pod.Spec.Containers {
 		opt := kubecontainer.RunContainerOptions{}
 		mounts, err := makeMounts(pod, e.getPodDir(pod.UID), &container, hostname, hostDomainName, pod.Status.PodIP, volumes)

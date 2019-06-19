@@ -143,6 +143,7 @@ type PodHelper interface {
 }
 
 type podActions struct {
+	InitContainersToStart []int
 	// ContainersToStart keeps a list of indexes for the containers to start,
 	// where the index is the index of the specific container in the pod spec (
 	// pod.Spec.Containers.
@@ -315,9 +316,34 @@ func (cm *containerManager) deleteContainerRecords(id string) {
 func (cm *containerManager) computePodActions(pod *v1.Pod) podActions {
 	log.LOGGER.Infof("compute pod actions %s: %+v", pod.Name, pod)
 	changes := podActions{
+		InitContainersToStart:  []int{},
 		ContainersToStart:      []int{},
 		ContainersToKill:       make(map[types.UID]containerToKillInfo),
 		ContainersRestartCount: make(map[string]int),
+	}
+
+	for idx, container := range pod.Spec.InitContainers {
+		innerContainer, ok := cm.getContainerFromMap(pod.UID, container.Name)
+		if !ok {
+			log.LOGGER.Infof("no container id for pod %s, need start container", pod.Name)
+			changes.InitContainersToStart = append(changes.InitContainersToStart, idx)
+			continue
+		}
+		status, err := cm.runtimeService.ContainerStatus(innerContainer.ID)
+		if err != nil {
+			log.LOGGER.Errorf("get container status for pod %s failed: %v", pod.Name, err)
+		}
+
+		if status != nil && status.State == cri.StatusEXITED && status.ExitCode == 0 {
+			log.LOGGER.Infof("init container %s exitCode is 0, do not need to start container", container.Name)
+			continue
+		}
+		changes.ContainersToKill[types.UID(status.ID.ID)] = containerToKillInfo{
+			name:      container.Name,
+			container: &container,
+			message:   fmt.Sprintf("Container will be killed and recreated."),
+		}
+		changes.InitContainersToStart = append(changes.InitContainersToStart, idx)
 	}
 
 	for idx, container := range pod.Spec.Containers {
@@ -673,6 +699,64 @@ func (cm *containerManager) StartPod(pod *v1.Pod, helper PodHelper, provider sta
 		return err
 	}
 
+	// create and start init container
+	for _, idx := range podContainerChanges.InitContainersToStart {
+		container := &pod.Spec.InitContainers[idx]
+		err := cm.runtimeService.EnsureImageExists(pod, container, secret)
+		if err != nil {
+			helper.AddToReasonCache(pod.Name+container.Name, apis.ErrImagePullBackOff, err.Error())
+			log.LOGGER.Errorf("container [%s] in pod [%s], image pull failed, %v", container.Name, pod.Name, err)
+			continue
+		}
+		log.LOGGER.Infof("create container [%s] in pod [%s]", container.Name, pod.Name)
+		exposedPorts, err := makePortsAndBindings(container.Ports)
+		if err != nil {
+			cm.backOff.Next(backOffKey, cm.backOff.Clock.Now())
+			log.LOGGER.Errorf("make container [%s] port for pod [%s] failed, %v", container.Name, pod.Name, err)
+			return err
+		}
+		// get device options
+		opts, err := cm.GenerateRunContainerOptions(pod, container)
+		if err != nil {
+			log.LOGGER.Errorf("generate pod [%s] container [%s] run container options failed, %v", pod.Name, container.Name, err)
+			continue
+		}
+
+		// update restart count
+		restartCount := 0
+		if podStatus, ok := provider.GetPodStatus(pod.UID); ok {
+			for _, containerStatus := range podStatus.ContainerStatuses {
+				if containerStatus.Name == container.Name {
+					// convert int32 to int
+					restartCount = int(containerStatus.RestartCount) + 1
+					break
+				}
+			}
+		} else {
+			log.LOGGER.Infof("can not get container[%s] status in pod [%s]", container.Name, pod.Name)
+		}
+		containerConfig := cm.createContainerConfig(pod, container, opts, exposedPorts, restartCount, hostname, runOpt)
+		containerID, err := cm.runtimeService.CreateContainer(containerConfig)
+		if err != nil {
+			cm.backOff.Next(backOffKey, cm.backOff.Clock.Now())
+			log.LOGGER.Errorf("start pod [%s] failed: %v ", string(pod.Name), err)
+			return err
+		}
+
+		innerContainer, err := cm.getContainer(containerID)
+		if err != nil {
+			log.LOGGER.Errorf("get container for pod [%s] container id [%s] failed, %v", pod.Name, containerID, err)
+		}
+		cm.setContainerFromMap(pod.UID, container.Name, innerContainer)
+
+		if err = cm.runtimeService.StartContainer(containerID); err != nil {
+			cm.backOff.Next(backOffKey, cm.backOff.Clock.Now())
+			log.LOGGER.Errorf("start pod [%s], container id [%s] failed, with err: [%s], remove the container.", pod.Name, containerID, err)
+			continue
+		}
+		log.LOGGER.Infof("start container for pod [%s] success", pod.Name)
+	}
+
 	for _, idx := range podContainerChanges.ContainersToStart {
 		container := &pod.Spec.Containers[idx]
 		err := cm.runtimeService.EnsureImageExists(pod, container, secret)
@@ -957,6 +1041,29 @@ func (cm *containerManager) GetPodStatusOwn(pod *v1.Pod, reasonCache *ReasonCach
 	}
 
 	podStatus := &v1.PodStatus{}
+	for _, specContainer := range pod.Spec.InitContainers {
+		if container, ok := podContainersMap[specContainer.Name]; ok {
+			status, err := cm.runtimeService.ContainerStatus(container.ID)
+			if err != nil {
+				status := &cri.ContainerStatus{ContainerStatus: kubecontainer.ContainerStatus{Name: specContainer.Name}}
+				kubeStatus := cm.toKubeContainerStatus(v1.PodUnknown, status)
+				podStatus.ContainerStatuses = append(podStatus.ContainerStatuses, kubeStatus)
+				continue
+			}
+			containerStatus := cm.convertStatusToAPIStatus(pod, status)
+			podStatus.ContainerStatuses = append(podStatus.ContainerStatuses, containerStatus)
+			continue
+		}
+
+		// especially for dealing image pull failed
+		reason, _ := reasonCache.Get(pod.Name + specContainer.Name)
+		if reason != nil {
+			status := &cri.ContainerStatus{
+				ContainerStatus: kubecontainer.ContainerStatus{Name: specContainer.Name, Message: reason.Message, Reason: reason.Err.Error()}}
+			kubeStatus := cm.toKubeContainerStatus(v1.PodPending, status)
+			podStatus.ContainerStatuses = append(podStatus.ContainerStatuses, kubeStatus)
+		}
+	}
 	for _, specContainer := range pod.Spec.Containers {
 		if container, ok := podContainersMap[specContainer.Name]; ok {
 			status, err := cm.runtimeService.ContainerStatus(container.ID)
